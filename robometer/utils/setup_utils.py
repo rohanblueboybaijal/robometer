@@ -300,6 +300,18 @@ def _load_checkpoint_weights_from_safetensors(
             # Try different remapping strategies
             potential_keys = []
 
+            # Released LIBERO checkpoints save the language model before PEFT wraps it.
+            # The instantiated Unsloth model places the same layers under
+            # language_model.base_model.model, including their LoRA weights.
+            if ckpt_key.startswith("model.model.language_model."):
+                potential_keys.append(
+                    ckpt_key.replace(
+                        "model.model.language_model.",
+                        "model.language_model.base_model.model.",
+                        1,
+                    )
+                )
+
             # Strategy 1 (PEFT): Map "model.model." -> "model.base_model.model.model." (for PEFT wrapped in RBM)
             # This handles the case where Unsloth saved the full model from model.model
             if ckpt_key.startswith("model.model."):
@@ -398,11 +410,7 @@ def _load_checkpoint_weights_from_safetensors(
     )
 
     if not progress_head_loaded:
-        logger.error("Progress head weights did not change after loading checkpoint!")
-        logger.error("This indicates the checkpoint weights were not loaded correctly.")
-        import ipdb
-
-        ipdb.set_trace()  # Breakpoint if progress_head didn't load
+        raise RuntimeError("Progress head weights did not load from checkpoint")
 
     # Verify adapter weights loaded correctly only when this helper loads them.
     # If load_adapters=False, PeftModel.from_pretrained has already loaded adapters
@@ -433,43 +441,24 @@ def _load_checkpoint_weights_from_safetensors(
                     logger.warning(f"Adapter key {key} not found in model after loading!")
                     adapter_loaded_correctly = False
 
-        # Check how many adapter keys from checkpoint were actually loaded
-        # Need to check both original and remapped keys (matching the remapping strategies above)
-        loaded_adapter_keys = []
-        for ckpt_key in checkpoint_adapter_keys:
-            # Check if original key exists in model
-            if ckpt_key in model_state_dict_after:
-                loaded_adapter_keys.append(ckpt_key)
-            else:
-                # Try remapping strategies to find the actual key used in model
-                potential_keys = []
-                if ckpt_key.startswith("model.model."):
-                    # Strategy 1: PEFT wrapped in RBM
-                    potential_keys.append(ckpt_key.replace("model.model.", "model.base_model.model.model.", 1))
-                    # Strategy 2: Fallback
-                    potential_keys.append(ckpt_key.replace("model.model.", "model.", 1))
-
-                # Check if any remapped key exists in model
-                for remapped_key in potential_keys:
-                    if remapped_key in model_state_dict_after:
-                        loaded_adapter_keys.append(ckpt_key)  # Count original key as loaded
-                        break
+        # Check what load_state_dict actually accepted, rather than inferring
+        # success from a key merely existing in the model.
+        loaded_adapter_keys = [
+            key for key in remapped_state_dict
+            if ("lora_A" in key or "lora_B" in key)
+            and key in model_state_dict_after
+            and key not in unexpected_keys
+        ]
         logger.info(f"Loaded {len(loaded_adapter_keys)}/{len(checkpoint_adapter_keys)} adapter keys from checkpoint")
 
-        if len(loaded_adapter_keys) == 0:
-            logger.error("No adapter weights were loaded from checkpoint!")
-            adapter_loaded_correctly = False
-        elif len(loaded_adapter_keys) < len(checkpoint_adapter_keys) * 0.5:  # Less than 50% loaded
-            logger.warning(
-                f"Only {len(loaded_adapter_keys)}/{len(checkpoint_adapter_keys)} adapter keys loaded - may indicate structure mismatch"
+        if len(loaded_adapter_keys) != len(checkpoint_adapter_keys):
+            logger.error(
+                f"Only {len(loaded_adapter_keys)}/{len(checkpoint_adapter_keys)} adapter keys loaded"
             )
             adapter_loaded_correctly = False
 
     if not adapter_loaded_correctly:
-        logger.error("Adapter weights did not load correctly!")
-        import ipdb
-
-        ipdb.set_trace()  # Breakpoint if adapters didn't load correctly
+        raise RuntimeError("Adapter weights did not load correctly from checkpoint")
 
     logger.info(f"Successfully loaded checkpoint weights from {checkpoint_path}")
 
